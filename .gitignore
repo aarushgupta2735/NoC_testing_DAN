@@ -1,0 +1,20 @@
+# Python
+__pycache__/
+*.pyc
+*.egg-info/
+.pytest_cache/
+build/
+dist/
+
+# Environments
+.venv/
+venv/
+
+# Generated at run/train time (see run.py, pretrain.py, scripts/cli.py)
+*.pt
+top_100_data_*.txt
+multirun_*.txt
+
+# Benchmark input data (large / user-provided; keep the repo source-only)
+data/*.txt
+!data/.gitkeep

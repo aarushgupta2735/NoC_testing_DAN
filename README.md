@@ -1,216 +1,101 @@
-# LMGA_IGSA
+# Theory:
+1. Why preemption? What not have it 1 or 0? What's the tradeoff?
+    Large p : less subtasks (less total overhead) but more conflicts with other tests
+    Small p: more subtasks (more total overhead) but less conflicts with other tests
 
-Neural-guided genetic algorithm for core-to-IO mapping on a mesh-based
-many-core chip, with a learned, IO-conditioned preemption policy.
+Core specific properties that we must add for better preemption value calculation: 
 
-A pointer-network policy samples mappings and preemption schedules;
-those samples seed and get injected into a genetic algorithm's
-population; the GA's best individuals train the policy back via
-REINFORCE. The two search processes run in a loop, each making the
-other better.
+Patterns (p_count): Workload in the test sequence given to the core
+Scan: Fixed latency/subtask
 
-This repo is a restructuring of a single research script
-(`lmga_igsa.py`) into an installable package. The algorithm itself is
-unchanged — the split preserves four correctness fixes the original
-script needed (see below) and adds tests that check each fix directly
-rather than only by re-reading the code.
+# Objective: 
+1. Create a Multi-Head Attention based solution for mapping IO pairs to cores 
+2. Find preemption values for a particular IO channel (must take in conflicts from other core tests)
+The pattern scheduling is done by SFT scheduling. 
 
----
+# Architecture: 
+We split the problem across objectives in two phases (mapping and preemptive values).
 
-## Install
+## Inputs:
+    1. Take the embeggings for the mesh topology from a GNN
+    2. Core embeddings will have (x,y,pattern,scan) as input for each core
 
-```bash
-pip install -e .
-```
+## Model v1.0:
+    1. Multi Head Attention that takes concatenation of the all the core embeddings(transformed with a WQ) as Q, and the IO pairs embedding (Transformed with a WK) as the K and V. Softmax over scores to find the core for a given IO. 
+    
+    2. To find the preemption value, I not only want to give the model the IO embedding but also information of the cores that have been mapped to it. For this we use another attention layer that can allow the model to look back at its alloted cores and give scores. These scores would be used for performing a weighted average over the core embeddings for each core (transformer style) that was mapped to the particular IO pair (this can be optimised by using step 1 values again or interveaving both). The final vector is then concatenated with the IO pair and then fed to a MLP for preemptive value. 
 
-This installs the `lmga_igsa` package and a `lmga-igsa` console
-script. Requires Python ≥3.9; PyTorch, NumPy, and NetworkX are pulled
-in automatically (see `pyproject.toml`).
+## Model v1.1:
+    1. Stays as it is.
 
-## Quickstart
+    2. Preumption value not only depends upon the allocated cores to the particular IO pair but more on the conflicts with other tests. That information must be given for this decision. After phase 1, we will be computing this conflict embedding using a GNN by reusing the check_path_conflict in simulator.py on the computed IO-Core mapping. We cache these values to use later during SFT to reduce added time complexity. We will be combining this conflict embedding with the per-core embedding with an MLP directly instead of weighted average one in v1.0 to get the preemptive value. This assumes that we have already given all the conflict related information with the conflict embedding.  
 
-```bash
-# Pretrain the mapping backbone only (preemption head stays at random init)
-lmga-igsa --mode pretrain --num_cores 32 --num_io 2 --epoch 1000
+## Model v2:
 
-# Full NN+GA co-training run
-lmga-igsa --mode run --num_cores 32 --num_io 2
+Per-core input features: [row, col, patterns, scan] (4-dim)
 
-# Repeat a run N times for the mean/std numbers a results table needs
-lmga-igsa --mode multirun --num_cores 32 --num_io 2 --num_runs 10
-```
+### Phase 1 (mapping): 
+all cores' features → linear projection → Q; all IOs' embeddings → linear projections → K, V; multi-head cross-attention, softmax over IOs per core; hard sample one IO per core. This retires the LSTM encoder/decoder entirely — no recurrence, single parallel attention pass.
 
-Add `--cuda` to any mode to use a GPU if one is available; all three
-modes default to CPU otherwise.
+### Intermediate: Conflict table (shared utility, data.py): 
+Given a resolved mapping, compute the full N*N pairwise check_path_conflict table once. Passed to both phase 2 and the simulator.
 
-Benchmark input files (`bm_<N>cores.txt` for `run`, `data_<N>cores.txt`
-for `pretrain`) are expected in the working directory you run from. If
-missing, a warning prints and synthetic dummy core data is generated
-instead — useful for a quick smoke test, not for real numbers.
+### Phase 2 (preemption), per-core:
 
-### Ablation flags (paper Table 5: "what part of IGSA matters?")
+Conflict-GNN: a GAT over the conflict-table-derived graph, operating on raw core features (position+patterns+scan) independently from phase 1 — produces a g_c context vector per core.
+MLP(concat(core_embedding, g_c)) → preemption bucket logits, per core. No attention/weighted-average step.
 
-| Flag | Effect | Isolates |
-|---|---|---|
-| `--disable_preemption_head` | random bucket preemptions instead of the learned head | the mapping head's contribution |
-| `--disable_constructive` | no NN-sampled individuals injected into the GA | the constructive operator's contribution |
-| `--disable_inloop_updates` | only the end-of-outer-iteration update fires | the in-loop update's contribution |
-| `--disable_warmup` | skip the supervised head warm-up | whether warm-up is actually needed |
-| `--continuous_preemptions` | revert fix #2 — continuous draws instead of bucket-snapped | whether action/reward consistency matters |
+### Simulator:
+Accepts an optional precomputed conflict table; looks up instead of recomputing check_path_conflict inline.
 
-Run once with no flags (full model), then once per flag, for the five
-rows of an ablation table.
+### Training: 
+No detach anywhere (per our earlier, confirmed decision) — both phases' log-probs backprop through the shared core-feature projections. 
 
----
 
-## Architecture
+## Training:
+    1. After pretraining, we use REINFORCE.
 
-```
-src/lmga_igsa/
-    config.py       constants: preemption buckets, dims, defaults        (leaf)
-    data.py          problem instance loading: cores, IO pairs, topology  (leaf)
-    simulator.py      makespan fitness function / environment              (leaf)
-    model.py            PointerNet: sampling + teacher-forced log-probs     (leaf)
-    ga.py                 Individual / Population / genetic operators        (leaf)
-    reinforce.py            REINFORCE update + head warm-up  — model × ga glue
-    pretrain.py                mapping-backbone-only pretraining
-    run.py                        outer-loop orchestration (run_lmga)
-    cli.py                           argparse + mode dispatch
-scripts/cli.py    thin wrapper — lets `python scripts/cli.py ...` work without installing
-tests/            one test file per leaf module, plus reinforce.py
-```
+# Open Questions:
+- Why one preemption value for a IO pair ?
 
-**Dependency direction is the thing to understand first.** `model.py`
-and `ga.py` do not import each other. `PointerNet` has no notion of a
-genetic algorithm; `Individual`/`Population` have no notion of a
-neural net. They are introduced to each other in exactly one place —
-`reinforce.py` — which takes a scored `Population` and produces
-gradient updates on a `PointerNet`. This mirrors the algorithm's real
-structure rather than an arbitrary file split, and it's why the model
-can be unit-tested with fake tensors and the GA with fake genes,
-independently of one another.
+# Potential Ideas for Later:
 
----
+Q. What if you weighted the mesh topology with p_count after mapping from phase 1?
 
-## Codebase Deep Dive: For Researchers & Developers
+1. reinforce.py 
+    -> try changing EMA to non discounted baseline
 
-If you want to extend this implementation (e.g., swapping the attention mechanism, adding new GA operators, modifying the simulator's logic, or parsing a different dataset), this section describes how the code blocks come together and the usage of various helper functions. 
+    Result:
 
-### How Everything Comes Together (The Pipeline)
+    -> switch reinforce with PPO 
 
-The entire algorithm is orchestrated inside `run_lmga` (located in `run.py`). Here is the step-by-step lifecycle of one outer-loop iteration:
+    Result:
 
-1. **Initialization:** `data.py` loads the geometric grid, core workloads, and IO pairs. 
-2. **Initial Population:** The Neural Network (`PointerNet`) auto-regressively samples mappings and conditional preemptions for 75% of the initial population. The remaining 25% are generated randomly. 
-3. **Evaluation:** `ga.evaluate_population_parallel` passes the raw mapping and preemption genes to the `simulator.py`, which computes a schedule makespan. The population is then sorted by makespan.
-4. **GA Evolution (In-Loop):** Over several generations, the GA executes `selection`, `crossover`, and `mutate`. Crucially, at each generation, the NN injects `NUM_CONSTRUCTIVE` fresh samples into the GA (the constructive operator).
-5. **In-Loop Model Update:** Periodically during evolution, the top ~30% of the GA population is fed into `reinforce._do_model_update`. The NN calculates teacher-forced log-probabilities (`model.get_log_prob_components`) on the GA's top trajectories, and updates the NN weights using an Advantage Actor-Critic (REINFORCE) loss.
-6. **Convergence & Head Warm-up:** The loop monitors for fitness stagnation. In the very first outer loop (if warmup is enabled), a special `warmup_preemption_head` is triggered on the top GA individuals to imitate the GA's schedule using supervised Negative Log Likelihood (NLL).
+## Other potential directions
 
-### Module Breakdown & Helper Functions
+### Multi-Agent Path Finding : 
+1. "Multi-Agent Deep Reinforcement Learning (MADRL) has emerged as a primary focus for decentralized conflict resolution (Orr & Dutta, 2023)." 
+2. To address conflicting paths in constrained environments, researchers frequently combine RL with Imitation Learning (IL). The PRIMAL framework, introduced by Sartoretti et al. (2019), trains agents to reactively plan paths while imitating centralized expert behavior. This hybrid approach enables implicit coordination in partially-observable environments without requiring explicit agent-to-agent communication.
+3. Ma et al. (2021) developed a deep Q-network framework named Distributed Heuristic Communication (DHC)
 
-#### `config.py`
-Stores all global constants to prevent circular imports. 
-* **`PREEMPTION_BUCKETS`**: The fixed discrete buckets `[0.20, 0.30, ..., 0.90]` that the NN preemption head predicts, which ensures action/reward consistency.
-* **Architecture Dimensions**: e.g., `INPUT_DIM`, `HIDDEN_DIM`, `IO_EMBED_DIM`, etc.
+Reference for this:
+Bello, I., Pham, H., Le, Q. V., Norouzi, M., & Bengio, S. (2016). Neural Combinatorial Optimization with Reinforcement Learning. arXiv. https://doi.org/10.48550/arxiv.1611.09940
+Cited by: 2961
 
-#### `data.py`
-Answers the question: *"What does this mapping problem look like?"*
-* **`Core` class**: A simple container for workload attributes (patterns, scan, core ID, etc.).
-* **`prep_data()`**: Parses the benchmark file, generates a synthetic fallback if the file is missing, and computes all-pairs shortest paths using NetworkX over the chip's mesh topology.
-* **`check_path_conflict(...)`**: A geometric collision test used by the simulator. It determines if two cores' subtasks will attempt to use a shared physical link on the mesh.
+Kool, W., van Hoof, H., & Welling, M. (2018). Attention, Learn to Solve Routing Problems! arXiv. https://doi.org/10.48550/arxiv.1803.08475
+Cited by: 2935
 
-#### `model.py`
-The neural policy consisting of an `Encoder`, a `Decoder`, an `Attention` (mapping) head, and a conditional `preemption_head`.
-* **`PointerNet`**: The main model container. 
-* **`forward(...)`**: Performs autoregressive *sampling*. Used when generating candidates to inject into the GA.
-* **`get_log_prob_components(...)`**: Performs *teacher-forcing*. It replays a fixed sequence (from the GA) and asks "What log-prob would the current policy assign to this?" This is used to compute gradients.
-* **Helper `_preempt_logits(...)`**: Contains the logic for detaching the backbone (Fix #6) and conditioning the preemption head on the selected IO channel (Fix #1).
+Ma, Z., Luo, Y., & Ma, H. (2021). Distributed Heuristic Multi-Agent Path Finding with Communication. 2021 IEEE International Conference on Robotics and Automation (ICRA), 8699–8705. https://doi.org/10.1109/icra48506.2021.9560748
+Cited by: 208
 
-#### `ga.py`
-Independent GA mechanics holding `Individual` and `Population`. 
-* **Genetic Operators**: `selection(pop, k)` (tournament), `crossover(parent1, parent2)` (single-segment contiguous crossover), and `mutate(ind, ...)` (uniform chance to reroll genes/preemptions).
-* **Helper `preemptions_to_bucket_indices(...)`**: Rounds continuous preemption values back to their nearest bucket index. 
-* **Helper `bucket_indices_to_preemptions(...)`**: Converts bucket indices to actual real-valued preemptions.
-* **Helper `evaluate_population_parallel(...)`**: Efficiently runs the Python multiprocessing pool across all unevaluated individuals, updates their fitness, and sorts the population.
+Mazyavkina, N., Sviridov, S., Ivanov, S., & Burnaev, E. (2021). Reinforcement learning for combinatorial optimization: A survey. Computers & Operations Research, 134, 105400. https://doi.org/10.1016/j.cor.2021.105400
+Cited by: 1188
 
-#### `simulator.py`
-The fitness environment mapping inputs to makespans.
-* **`simulate_single_mapping(args)`**: The core scheduling engine. It builds a Shortest Job First (SJF) queue of subtasks and inserts them into a global schedule layout, deferring tasks via the geometric `check_path_conflict` if needed.
-* **Helper `_insert_by_finish(lst, ev)`**: Binary-inserts a task into an active timeline, keeping the timeline sorted by finish time.
-* **Helper `_merge_sorted(intervals)`**: Merges overlapping contiguous execution intervals, enabling the simulator to find empty scheduling gaps. 
+Orr, J., & Dutta, A. (2023). Multi-Agent Deep Reinforcement Learning for Multi-Robot Applications: A Survey. Sensors, 23(7), 3625. https://doi.org/10.3390/s23073625
+Cited by: 337
 
-#### `reinforce.py`
-The glue between the Neural Network and the GA.
-* **`_do_model_update(...)`**: Takes the top-K population, pulls their genomes and rewards, computes an Exponential Moving Average (EMA) baseline advantage, and performs a gradient step on `PointerNet`. 
-* **`warmup_preemption_head(...)`**: Runs supervised Negative Log-Likelihood optimization strictly on the preemption head and IO embeddings using the GA's warmup output.
+Sartoretti, G., Kerr, J., Shi, Y., Wagner, G., Kumar, T. K. S., Koenig, S., & Choset, H. (2019). PRIMAL: Pathfinding via Reinforcement and Imitation Multi-Agent Learning. IEEE Robotics and Automation Letters, 4, 2378–2385. https://doi.org/10.1109/lra.2019.2903261
+Cited by: 712
 
-### File Interactions (Dependency Flow)
-
-Understanding how the files rely on each other is crucial for extending the codebase safely. The architecture adheres to a strict uni-directional flow:
-
-1. **Leaves (`config.py`, `data.py`, `model.py`, `ga.py`, `simulator.py`)**: 
-   - These modules **never** import `run.py` or `reinforce.py`.
-   - `model.py` and `ga.py` **do not import each other**. The PointerNet has no notion of "genes", and the GA has no notion of "tensors".
-   - `simulator.py` only imports `data.py` (for the conflict checker) and `config.py` (for buckets).
-
-2. **The Glue (`reinforce.py`)**:
-   - This is the **only** place where `model.py` and `ga.py` interact directly. It translates GA populations (genes/rewards) into PyTorch tensors, computes the REINFORCE loss via `model.get_log_prob_components`, and performs the gradient step.
-
-3. **The Orchestrator (`run.py` & `pretrain.py`)**:
-   - These files sit at the very top. They import all the leaves and the glue (`reinforce.py`) to manage the outer training loop, multiprocessing pools, ablation flags, and model I/O.
-
-## The four fixes
-
-The original script had four correctness bugs; this repo preserves
-the fixes, each with a direct test (not just a comment) verifying the
-property it guarantees:
-
-**#1 — IO-conditioned preemption head** (`model.py`). The preemption
-head takes `cat(decoder_output, io_embedding(selected_io))`, not just
-`decoder_output`. The right preemption schedule for a core genuinely
-depends on which IO channel it was routed to; without this the head
-can only represent the marginal `P(preempt | core)`, not the joint
-`P(preempt | core, IO)` the problem actually needs.
-→ tested in `tests/test_model_shapes.py::test_fix_1_preemption_logits_depend_on_selected_io`
-
-**#2 — Action/reward consistency via bucket-snapped preemptions**
-(`simulator.py`, `ga.py`). Every fresh preemption draw — random
-initial population, the simulator's fallback, gene-driven or
-independent mutation — samples from a fixed discrete bucket set
-instead of a continuous range. This guarantees the bucket-index
-*action* used in REINFORCE always refers to the same preemption
-*value* that produced the observed reward.
-→ tested in `tests/test_buckets.py` and `tests/test_simulator.py`
-
-**#3 — Head warm-up via supervised imitation** (`reinforce.py`,
-orchestrated from `run.py`). The first outer iteration runs with no
-constructive injection and no in-loop updates; afterward, the
-preemption head is trained via supervised NLL on the top-K
-individuals' `(genes, bucket-index)` pairs. From outer iteration 2
-onward the head is in-distribution before its first sample is ever
-used constructively, instead of contributing noise from a random init.
-→ tested in `tests/test_reinforce.py::test_warmup_preemption_head_only_updates_head_and_io_embed`
-
-**#6 — Backbone gradient isolation via `output.detach()`** (`model.py`).
-The preemption head's *training* path receives `output.detach()` as
-its feature input. Gradients from the preemption loss can reach
-`io_embed` and `preemption_head`, but never the encoder, decoder, or
-attention — so the pretrained mapping backbone can't be contaminated
-by noisy preemption-head gradients. The mapping loss has no such
-detach, and does reach the backbone; the asymmetry is the whole point.
-→ tested directly via autograd in
-`tests/test_model_shapes.py::test_fix_6_preemption_gradient_does_not_reach_backbone`
-and `test_fix_6_mapping_gradient_does_reach_backbone`
-
-## Testing
-
-```bash
-python -m pytest tests/ -v
-```
-
-30 tests across five files, one per leaf module plus `reinforce.py`.
-The two tests worth reading first if you want to understand what
-actually matters in this codebase are the fix #6 pair above — they
-backprop through each loss term in isolation and assert exactly which
-parameters moved.
+Zhang, C., Song, W., Cao, Z., Zhang, J., Tan, P. S., & Xu, C. (2020). Learning to Dispatch for Job Shop Scheduling via Deep Reinforcement Learning. arXiv. https://doi.org/10.48550/arxiv.2010.12367
+Cited by: 736

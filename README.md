@@ -1,3 +1,5 @@
+# A DAN inspired attempt at solving NoC testing
+
 # Theory:
 1. Why preemption? What not have it 1 or 0? What's the tradeoff?
     Large p : less subtasks (less total overhead) but more conflicts with other tests
@@ -7,6 +9,9 @@ Core specific properties that we must add for better preemption value calculatio
 
 Patterns (p_count): Workload in the test sequence given to the core
 Scan: Fixed latency/subtask
+
+# Current Main State
+We have the lmga_igsa code as the starter code to build on top of : https://github.com/aarushgupta2735/NoC_testing_LMGA_IGSA 
 
 # Objective: 
 1. Create a Multi-Head Attention based solution for mapping IO pairs to cores 

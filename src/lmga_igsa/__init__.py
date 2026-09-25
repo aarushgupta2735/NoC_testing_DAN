@@ -1,11 +1,11 @@
-"""LMGA_IGSA: neural-guided genetic algorithm for core-to-IO
-mapping with a learned, IO-conditioned preemption policy."""
+"""LMGA_IGSA: neural-guided genetic algorithm for core-to-IO mapping
+with a learned, conflict-aware preemption policy (v2 architecture —
+see model_v1_backup.py for the retired LSTM version)."""
 
-from .model import PointerNet
+from .model import PointerNetV2
 from .ga import Individual, Population
 from .run import run_lmga
-from .pretrain import pretrain_model
 
-__all__ = ["PointerNet", "Individual", "Population", "run_lmga", "pretrain_model"]
+__all__ = ["PointerNetV2", "Individual", "Population", "run_lmga"]
 
 __version__ = "0.1.0"

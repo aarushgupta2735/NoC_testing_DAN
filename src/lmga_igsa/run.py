@@ -1,20 +1,26 @@
 """
 The outer loop: run_lmga. Orchestrates the full NN+GA co-training
 cycle — initial population (NN + random), GA evolution with
-constructive injection and in-loop REINFORCE updates, and end-of-outer
-either a supervised head warm-up (fix #3, first outer iter only) or a
-full REINFORCE update.
+constructive injection and in-loop REINFORCE updates, and an
+end-of-outer REINFORCE update.
+
+v2 change from v1: no warm-up phase (fix #3 is retired — see
+reinforce.py's module docstring for why it doesn't apply to this
+architecture). Every outer iteration, including the first, runs the
+same way: sample from the model (both phases), evolve, update.
 
 This module wires together every other module in the package:
-  data.py       -> problem instance
-  model.py      -> PointerNet (sampling + training)
+  data.py       -> problem instance, core features, conflict tables
+  model.py      -> PointerNetV2 (phase 1 mapping + phase 2 preemption)
   ga.py         -> Individual/Population/operators/evaluation
-  reinforce.py  -> the REINFORCE + warm-up updates
+  reinforce.py  -> the REINFORCE update
 
-Ablation flags (see module-level ABLATION NOTES below each block) let
-you isolate the contribution of the preemption head, the constructive
-operator, the in-loop updates, and the warm-up independently — this is
-what feeds Table 5 in the paper.
+Ablation flags let you isolate the contribution of the preemption
+head, the constructive operator, and the in-loop updates
+independently. --disable_warmup and --head_warmup_epochs are retained
+in the CLI surface (cli.py) for backward-compatible invocation but are
+no-ops here, since there is no warm-up phase to disable in v2 — see
+cli.py for how this is surfaced to the user.
 """
 
 import copy
@@ -23,19 +29,57 @@ import os
 import random
 from time import time
 
+import numpy as np
 import torch
 
 from .config import (
-    DROPOUT_P, EMA_DECAY, HEAD_WARMUP_EPOCHS, HIDDEN_DIM, IMPROVEMENT_THRESHOLD,
-    INPUT_DIM, NUM_CONSTRUCTIVE, NUM_RNN_LAYERS, PREEMPTION_BUCKETS, UPDATE_INTERVAL,
+    EMA_DECAY, HIDDEN_DIM_V2, IMPROVEMENT_THRESHOLD, NUM_ATTN_HEADS_V2,
+    NUM_CONSTRUCTIVE, PREEMPTION_BUCKETS, UPDATE_INTERVAL,
 )
-from .data import prep_data
+from .data import build_conflict_table, create_core_features_v2, create_data, prep_data
 from .ga import (
     Individual, Population, bucket_indices_to_preemptions, crossover,
     evaluate_population_parallel, mutate, random_preemption_vector, selection,
 )
-from .model import PointerNet
-from .reinforce import _do_model_update, warmup_preemption_head
+from .model import PointerNetV2
+from .reinforce import _do_model_update
+
+
+def _sample_individuals(model, core_features, io_features, dir_np, io_pairs,
+                         num_samples, use_preemption_head, continuous_preemptions,
+                         num_cores):
+    """
+    Sample num_samples individuals from the model: phase 1 (mapping),
+    then — unless use_preemption_head is False — build each sample's
+    conflict table from its own sampled mapping and run phase 2.
+
+    Returns a list of (genes, preemptions) tuples, not Individuals
+    directly, so callers can decide fitness/id bookkeeping.
+    """
+    model.eval()
+    with torch.no_grad():
+        batch_core = core_features.repeat(num_samples, 1, 1)
+        batch_io = io_features.repeat(num_samples, 1, 1)
+
+        sampled_mapping, _, _ = model.sample_mapping(batch_core, batch_io)  # (num_samples, num_cores)
+
+        if use_preemption_head:
+            tables = [
+                build_conflict_table(dir_np, sampled_mapping[i].numpy(), io_pairs)
+                for i in range(num_samples)
+            ]
+            conflict_adj = torch.from_numpy(np.stack(tables).astype("float32"))
+            sampled_preempt, _ = model.predict_preemption(batch_core, conflict_adj)
+
+    results = []
+    for i in range(num_samples):
+        genes = sampled_mapping[i].tolist()
+        if use_preemption_head:
+            preemptions = bucket_indices_to_preemptions(sampled_preempt[i].tolist())
+        else:
+            preemptions = random_preemption_vector(num_cores, continuous=continuous_preemptions)
+        results.append((genes, preemptions))
+    return results
 
 
 def run_lmga(num_cores, num_io, ga_generations_per_iter=100, pop_size=100,
@@ -45,47 +89,43 @@ def run_lmga(num_cores, num_io, ga_generations_per_iter=100, pop_size=100,
              disable_preemption_head=False,
              disable_constructive=False,
              disable_inloop_updates=False,
-             disable_warmup=False,
              continuous_preemptions=False,
-             head_warmup_epochs=HEAD_WARMUP_EPOCHS,
              num_constructive=NUM_CONSTRUCTIVE,
              update_interval=UPDATE_INTERVAL):
 
     device = device or torch.device("cpu")
     start_time = time()
 
-    print(f"--- LMGA-IGSA-FIXED Run: {num_cores}c {num_io}io ---")
+    print(f"--- LMGA-IGSA v2 Run: {num_cores}c {num_io}io ---")
+    print(f"    Architecture: two-phase attention/GAT (no LSTM, no warm-up)")
     print(f"    Preemption buckets: {PREEMPTION_BUCKETS}")
     print(f"    Preemption draws: {'CONTINUOUS (#2 removed)' if continuous_preemptions else 'BUCKET-SNAPPED (#2 on)'}")
     print(f"    Constructive: {0 if disable_constructive else num_constructive}/gen")
     print(f"    In-loop updates: {'OFF' if disable_inloop_updates else f'every {update_interval} gens'}")
-    print(f"    Head warm-up: {'OFF' if disable_warmup else f'{head_warmup_epochs} epochs at end of outer 1'}")
-    print(f"    Preemption head: {'OFF (random)' if disable_preemption_head else 'ON (IO-conditioned)'}")
+    print(f"    Preemption head: {'OFF (random)' if disable_preemption_head else 'ON (conflict-GAT + MLP)'}")
 
-    data, cores, io, all_hops = prep_data(num_cores, num_io, test=True)
-    data_tensor = data.permute(1, 0, 2).to(device)
-    dir_coords = data_tensor[:, 0, :]
+    position_data, cores, io, all_hops = prep_data(num_cores, num_io, test=True)
+    core_feat_full = create_core_features_v2(position_data, cores)  # (batch, num_cores, 4)
+    core_features = core_feat_full[0:1].to(device)                   # this run uses instance 0
+    dir_np = position_data[0].numpy()
+
+    io_arr = np.asarray(io, dtype="float32")  # (num_io, 2) — [src, sink], used as phase-1's raw IO features
+    io_features = torch.from_numpy(io_arr).unsqueeze(0).to(device)   # (1, num_io, 2)
     num_io_local = len(io)
-    mask = torch.ones(1, num_cores, device=device)
 
-    model = PointerNet(INPUT_DIM, HIDDEN_DIM, NUM_RNN_LAYERS, DROPOUT_P, device).to(device)
+    model = PointerNetV2(hidden_dim=HIDDEN_DIM_V2, num_heads=NUM_ATTN_HEADS_V2, device=device).to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=1e-4)
 
-    # Load pretrained backbone. Head + io_embed start random if no
-    # checkpoint has warmed them up yet — that's fine, because
-    # warmup_preemption_head trains them before they affect search.
-    pretrained_path = f"lmga_model_{num_cores}cores_{num_io}io.pt"
-    if os.path.exists(pretrained_path):
+    checkpoint_path = f"lmga_v2_model_{num_cores}cores_{num_io}io.pt"
+    if os.path.exists(checkpoint_path):
         try:
-            state_dict = torch.load(pretrained_path, map_location=device)
-            missing, _ = model.load_state_dict(state_dict, strict=False)
-            new_keys = [m for m in missing if any(k in m for k in ["preemption", "io_embed"])]
-            print(f"Loaded backbone from {pretrained_path}; "
-                  f"{len(new_keys)} head/io_embed keys at random init (will be warmed up).")
+            state_dict = torch.load(checkpoint_path, map_location=device)
+            model.load_state_dict(state_dict)
+            print(f"Loaded checkpoint from {checkpoint_path}.")
         except Exception as e:
-            print(f"Error loading model ({e}), starting fresh.")
+            print(f"Error loading checkpoint ({e}), starting fresh.")
     else:
-        print("No pretrained model found. Starting from scratch.")
+        print("No checkpoint found. Starting from scratch (no warm-up, no separate pretraining).")
 
     best_global_fitness = float("-inf")
     best_global_mapping = None
@@ -99,43 +139,28 @@ def run_lmga(num_cores, num_io, ga_generations_per_iter=100, pop_size=100,
     num_workers = mp.cpu_count()
     pool = mp.Pool(processes=num_workers)
 
-    # Skip warm-up bookkeeping entirely if warm-up is disabled or the
-    # head itself is disabled (nothing to warm up).
-    head_warmed_up = disable_warmup or disable_preemption_head
-
     try:
         while stability_counter < stability_target:
             outer_loop_iter += 1
-            # Only the FIRST outer iter is treated as warm-up. During
-            # warm-up: no constructive injection, no in-loop updates,
-            # random bucket preemptions for NN-sampled individuals. The
-            # head is then trained on the warm-up's top-K (fix #3)
-            # before outer iter 2 begins.
-            in_warmup = (outer_loop_iter == 1) and not head_warmed_up
 
-            current_constructive = 0 if (disable_constructive or in_warmup) else num_constructive
-            do_inloop = (not disable_inloop_updates) and (not in_warmup)
+            current_constructive = 0 if disable_constructive else num_constructive
+            do_inloop = not disable_inloop_updates
 
             # ====================================================
             # A. Initial population
             # ====================================================
             pop_list = []
             num_from_model = int(pop_size * 0.75)
-            model.eval()
-            with torch.no_grad():
-                use_head_for_init = not (in_warmup or disable_preemption_head)
-                sampled_mappings, sampled_preemptions, _ = model(
-                    data_tensor[:, 0:1, :], num_io_local, mask,
-                    num_samples=num_from_model,
-                    use_preemption_head=use_head_for_init,
-                )
-                for i in range(num_from_model):
-                    genes = sampled_mappings[i].tolist()
-                    if use_head_for_init:
-                        preemptions = bucket_indices_to_preemptions(sampled_preemptions[i].tolist())
-                    else:
-                        preemptions = random_preemption_vector(num_cores, continuous=continuous_preemptions)
-                    pop_list.append(Individual(genes, preemptions=preemptions))
+
+            sampled = _sample_individuals(
+                model, core_features, io_features, dir_np, io,
+                num_samples=num_from_model,
+                use_preemption_head=not disable_preemption_head,
+                continuous_preemptions=continuous_preemptions,
+                num_cores=num_cores,
+            )
+            for genes, preemptions in sampled:
+                pop_list.append(Individual(genes, preemptions=preemptions))
 
             num_random = pop_size - num_from_model
             for _ in range(num_random):
@@ -144,7 +169,7 @@ def run_lmga(num_cores, num_io, ga_generations_per_iter=100, pop_size=100,
                 pop_list.append(Individual(genes, preemptions=preemptions))
 
             population = Population(pop_list)
-            evaluate_population_parallel(population, dir_coords, cores, io, all_hops, pool=pool)
+            evaluate_population_parallel(population, position_data[0], cores, io, all_hops, pool=pool)
 
             # ====================================================
             # B. GA evolution loop
@@ -160,31 +185,24 @@ def run_lmga(num_cores, num_io, ga_generations_per_iter=100, pop_size=100,
                     child = mutate(child, num_io_local, rate=0.05, continuous=continuous_preemptions)
                     next_gen.append(child)
 
-                # Constructive operator (skipped during warm-up or when disabled)
                 if current_constructive > 0:
-                    model.eval()
-                    with torch.no_grad():
-                        nn_mappings, nn_preemptions, _ = model(
-                            data_tensor[:, 0:1, :], num_io_local, mask,
-                            num_samples=current_constructive,
-                            use_preemption_head=not disable_preemption_head,
-                        )
-                        for i in range(current_constructive):
-                            genes = nn_mappings[i].tolist()
-                            if disable_preemption_head:
-                                preemptions = random_preemption_vector(num_cores, continuous=continuous_preemptions)
-                            else:
-                                preemptions = bucket_indices_to_preemptions(nn_preemptions[i].tolist())
-                            next_gen.append(Individual(genes, preemptions=preemptions))
+                    sampled = _sample_individuals(
+                        model, core_features, io_features, dir_np, io,
+                        num_samples=current_constructive,
+                        use_preemption_head=not disable_preemption_head,
+                        continuous_preemptions=continuous_preemptions,
+                        num_cores=num_cores,
+                    )
+                    for genes, preemptions in sampled:
+                        next_gen.append(Individual(genes, preemptions=preemptions))
 
                 population.individuals = next_gen
-                evaluate_population_parallel(population, dir_coords, cores, io, all_hops, pool=pool)
+                evaluate_population_parallel(population, position_data[0], cores, io, all_hops, pool=pool)
 
-                # In-loop model update (skipped during warm-up or when disabled)
                 if do_inloop and ((g + 1) % update_interval == 0):
                     ema_baseline = _do_model_update(
-                        model, optimizer, population, data_tensor, mask,
-                        num_io_local, ema_baseline, EMA_DECAY,
+                        model, optimizer, population, core_features, io_features,
+                        dir_np, io, ema_baseline, EMA_DECAY,
                         train_preempt_head=not disable_preemption_head,
                     )
 
@@ -204,8 +222,7 @@ def run_lmga(num_cores, num_io, ga_generations_per_iter=100, pop_size=100,
             if is_real_improvement and current_fitness > best_global_fitness:
                 tag = "FIRST BEST" if best_global_fitness == float("-inf") else "NEW BEST"
                 pct = f" ({relative_improvement * 100:+.2f}%)" if best_global_fitness != float("-inf") else ""
-                wtag = " [warmup]" if in_warmup else ""
-                print(f"[Iter {outer_loop_iter}] {tag}: {current_fitness:.2f}{pct}{wtag}")
+                print(f"[Iter {outer_loop_iter}] {tag}: {current_fitness:.2f}{pct}")
                 best_global_fitness = current_fitness
                 best_global_mapping = current_best_ind.genes
                 best_global_preemptions = current_best_ind.preemptions
@@ -213,39 +230,18 @@ def run_lmga(num_cores, num_io, ga_generations_per_iter=100, pop_size=100,
                 stability_counter = 0
             else:
                 stability_counter += 1
-                wtag = " [warmup]" if in_warmup else ""
                 print(f"[Iter {outer_loop_iter}] Found {current_fitness:.2f} "
                       f"(Best: {best_global_fitness:.2f}) "
-                      f"[stable: {stability_counter}/{stability_target}]{wtag}")
+                      f"[stable: {stability_counter}/{stability_target}]")
 
             # ====================================================
-            # D. End-of-outer: head warm-up OR full REINFORCE update
+            # D. End-of-outer REINFORCE update
             # ====================================================
-            if in_warmup and not head_warmed_up and not disable_preemption_head:
-                population.sort()
-                top_k = max(5, len(population.individuals) // 3)
-                top_samples = [
-                    (ind.genes, ind.preemptions, ind.fitness)
-                    for ind in population.individuals[:top_k]
-                ]
-                print(f"--- End of warm-up: training preemption head on top-{top_k} samples ---")
-                warmup_preemption_head(
-                    model, top_samples, data_tensor, mask, num_io_local,
-                    epochs=head_warmup_epochs,
-                )
-                head_warmed_up = True
-                print("--- Head warm-up complete; outer 2+ will use trained head ---")
-                # Don't run the mapping REINFORCE update on this iter —
-                # the warm-up GA pop is closer to random than to a
-                # learned signal. Also reset stability so the warm-up
-                # iter doesn't count against convergence budget.
-                stability_counter = 0
-            else:
-                ema_baseline = _do_model_update(
-                    model, optimizer, population, data_tensor, mask,
-                    num_io_local, ema_baseline, EMA_DECAY,
-                    train_preempt_head=not disable_preemption_head,
-                )
+            ema_baseline = _do_model_update(
+                model, optimizer, population, core_features, io_features,
+                dir_np, io, ema_baseline, EMA_DECAY,
+                train_preempt_head=not disable_preemption_head,
+            )
 
     finally:
         pool.close()
@@ -268,11 +264,10 @@ def run_lmga(num_cores, num_io, ga_generations_per_iter=100, pop_size=100,
         top_100 = population.individuals[:100]
 
     with open(output_filename, "w") as f:
-        f.write(f"# Algorithm: LMGA-IGSA-FIXED\n")
+        f.write(f"# Algorithm: LMGA-IGSA v2 (two-phase attention/GAT)\n")
         f.write(f"# Ablation flags: disable_preemption_head={disable_preemption_head}, "
                 f"disable_constructive={disable_constructive}, "
-                f"disable_inloop_updates={disable_inloop_updates}, "
-                f"disable_warmup={disable_warmup}\n")
+                f"disable_inloop_updates={disable_inloop_updates}\n")
         f.write(f"# Preemption Buckets: {PREEMPTION_BUCKETS}\n")
         f.write(f"# Overall Best Fitness: {best_global_fitness}\n")
         f.write(f"# Total Execution Time: {total_time:.4f} seconds\n")
@@ -284,5 +279,5 @@ def run_lmga(num_cores, num_io, ga_generations_per_iter=100, pop_size=100,
     print(f"Top 100 individuals saved to {output_filename}")
 
     if save_model:
-        torch.save(model.state_dict(), f"lmga_model_{num_cores}cores_{num_io}io.pt")
+        torch.save(model.state_dict(), checkpoint_path)
     return best_global_fitness

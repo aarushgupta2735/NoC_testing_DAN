@@ -57,20 +57,43 @@ def simulate_single_mapping(args):
     Simulate one (mapping, preemption) assignment and return
     (-makespan, schedule_log, preemptions_used).
 
-    args is either:
-      (mapping, dir_np, core_config, ioArray, all_hops, stored_preemptions)
-      (mapping, dir_np, core_config, ioArray, all_hops)   # legacy 5-tuple
+    args is one of:
+      (mapping, dir_np, core_config, ioArray, all_hops, stored_preemptions, conflict_table)
+      (mapping, dir_np, core_config, ioArray, all_hops, stored_preemptions)  # legacy 6-tuple
+      (mapping, dir_np, core_config, ioArray, all_hops)                     # legacy 5-tuple
 
     stored_preemptions, when given, is used as-is (this is the normal
     path: the GA's Individual already carries bucket-aligned
     preemptions). When None or mismatched in length, a fresh
     bucket-snapped vector is drawn (fix #2's fallback).
+
+    conflict_table, when given, is an (N, N) boolean array from
+    data.build_conflict_table for this exact mapping — every pairwise
+    check_path_conflict result precomputed once. When supplied, the
+    scheduling loop below looks values up in this table instead of
+    calling check_path_conflict inline; check_path_conflict is a pure
+    function of a fixed mapping, so results are identical either way,
+    but the table avoids re-deriving the same pair's result on every
+    one of the (possibly many) times that pair is re-examined as cores
+    re-enter the scheduling queue across their subtasks. When None,
+    check_path_conflict is called inline as before (this remains the
+    default so this function keeps working standalone, e.g. from
+    tests or callers that only need one-off evaluation).
     """
-    if len(args) == 6:
+    if len(args) == 7:
+        mapping, dir_np, core_config, ioArray, all_hops, stored_preemptions, conflict_table = args
+    elif len(args) == 6:
         mapping, dir_np, core_config, ioArray, all_hops, stored_preemptions = args
+        conflict_table = None
     else:
         mapping, dir_np, core_config, ioArray, all_hops = args
         stored_preemptions = None
+        conflict_table = None
+
+    def _conflicts(c1, s1, k1, c2, s2, k2):
+        if conflict_table is not None:
+            return bool(conflict_table[c1, c2])
+        return check_path_conflict(dir_np, c1, s1, k1, c2, s2, k2)
 
     num_cores = len(mapping)
     numIo = len(ioArray)
@@ -152,7 +175,7 @@ def simulate_single_mapping(args):
                 if startTime[coreId] < f2:
                     ioIndex2 = int(mapping[core2])
                     src2, sink2 = ioArray[ioIndex2][0] - 1, ioArray[ioIndex2][1] - 1
-                    if check_path_conflict(dir_np, coreId, src1, sink1, core2, src2, sink2):
+                    if _conflicts(coreId, src1, sink1, core2, src2, sink2):
                         startTime[coreId] = max(startTime[coreId], f2)
                         isConflict = True
 
@@ -173,7 +196,7 @@ def simulate_single_mapping(args):
                         continue
                     ioIndex2 = int(mapping[core2])
                     src2, sink2 = ioArray[ioIndex2][0] - 1, ioArray[ioIndex2][1] - 1
-                    if check_path_conflict(dir_np, coreId, src1, sink1, core2, src2, sink2):
+                    if _conflicts(coreId, src1, sink1, core2, src2, sink2):
                         if s2 < startTime[coreId]:
                             intervals.append([s2, f2])
 

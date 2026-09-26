@@ -12,10 +12,10 @@ import random
 import numpy as np
 import torch
 
-from lmga_igsa.config import PREEMPTION_BUCKETS
-from lmga_igsa.ga import Individual, Population
-from lmga_igsa.model import PointerNetV2
-from lmga_igsa.reinforce import _do_model_update
+from src.lmga_igsa.config import PREEMPTION_BUCKETS
+from src.lmga_igsa.ga import Individual, Population
+from src.lmga_igsa.model import PointerNetV2
+from src.lmga_igsa.reinforce import _do_model_update
 
 DEVICE = torch.device("cpu")
 

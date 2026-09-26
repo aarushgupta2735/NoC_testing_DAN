@@ -54,14 +54,16 @@ MLP(concat(core_embedding, g_c)) → preemption bucket logits, per core. No atte
 Accepts an optional precomputed conflict table; looks up instead of recomputing check_path_conflict inline.
 
 ### Training: 
-No detach anywhere (per our earlier, confirmed decision) — both phases' log-probs backprop through the shared core-feature projections. 
+- No detach anywhere (per our earlier, confirmed decision) — both phases' log-probs backprop through the shared core-feature projections.
+- Reinforce
 
+### PreTraining (V2_pretrain branch) :
+In v1, we were using pretraining to train our IO-mapping phase without phase 2 and GA. 
+v2 was not using pretraining but this can have quite a lot of problems as REINFORCE can be unstable. 
+Therefore we are creating a configurable option to pretrain our IO-mapper with a known preumption head assumed (hyperparameter). Unlike v1's pretraining, we plan to also use GA's new samples during pretraining as this would allow the model to explore more unlike v1 (the only exploration is sampling from its ploicy and not argmax).
 
-## Training:
-    1. After pretraining, we use REINFORCE.
-
-# Open Questions:
-- Why one preemption value for a IO pair ?
+## Open Questions:
+- Why one preemption value for a IO pair ? Why a particular constant for division?
 
 # Potential Ideas for Later:
 

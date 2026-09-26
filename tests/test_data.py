@@ -10,7 +10,7 @@ than one or two hand-picked cases.
 
 import numpy as np
 
-from lmga_igsa.data import build_conflict_table, check_path_conflict
+from src.lmga_igsa.data import build_conflict_table, check_path_conflict
 
 
 def _scalar_conflict_table(dir_np, mapping, io_array):

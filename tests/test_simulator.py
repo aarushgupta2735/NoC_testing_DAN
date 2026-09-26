@@ -1,7 +1,7 @@
 import numpy as np
 
-from lmga_igsa.data import prep_data
-from lmga_igsa.simulator import simulate_single_mapping
+from src.lmga_igsa.data import prep_data
+from src.lmga_igsa.simulator import simulate_single_mapping
 
 
 def _tiny_problem(num_cores=6, num_io=2):
@@ -62,7 +62,7 @@ def test_simulate_with_precomputed_conflict_table_matches_inline():
     # function of a fixed mapping, this MUST be behavior-preserving —
     # same makespan, same preemptions_used, every time.
     import random
-    from lmga_igsa.data import build_conflict_table
+    from src.lmga_igsa.data import build_conflict_table
 
     num_cores, num_io = 16, 4
     dir_np, core_config, io, all_hops = _tiny_problem(num_cores, num_io)

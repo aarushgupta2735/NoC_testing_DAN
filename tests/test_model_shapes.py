@@ -19,8 +19,8 @@ matter most in this architecture:
 import numpy as np
 import torch
 
-from lmga_igsa.data import build_conflict_table
-from lmga_igsa.model import PointerNetV2
+from src.lmga_igsa.data import build_conflict_table
+from src.lmga_igsa.model import PointerNetV2
 
 DEVICE = torch.device("cpu")
 
